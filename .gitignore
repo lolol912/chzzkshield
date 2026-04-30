@@ -21,7 +21,6 @@ desktop.ini
 .idea/
 *.swp
 *.swo
-*~
 
 # Build artifacts
 *.o
@@ -31,11 +30,11 @@ desktop.ini
 # Temporary files
 tmp/
 temp/
-check_twitch/
+check_chzzk/
 test_extract/
 verify_ipa/
 dylib_output/
 
 # Injected IPAs (keep originals)
-*+TwitchProxy.ipa
-*+Proxy.ipa
+*+CHZZKShield.ipa
+*+CHZZK.ipa

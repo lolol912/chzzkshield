@@ -1,323 +1,368 @@
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
+#import <WebKit/WebKit.h>
+#import <objc/runtime.h>
 #import <substrate.h>
 
-static NSArray<NSString *> *proxyServers = nil;
-static NSString *capturedAuthToken = nil;
-static NSString *const proxyAdBlockMode = @"adblock";
+typedef NS_ENUM(NSUInteger, CHZZKRequestPolicy) {
+    CHZZKRequestPolicyAllow = 0,
+    CHZZKRequestPolicyStubAdPolling,
+    CHZZKRequestPolicyBlock
+};
 
-static NSString *trimmedString(NSString *value) {
-    if (!value || ![value isKindOfClass:[NSString class]]) return nil;
-    return [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+static NSString *const kCHZZKAdPollingResponse = @"{\"hacked\":1,\"id\":null,\"event\":null,\"ts\":null,\"adCount\":null,\"adControlType\":\"STUDIO_CONTROL\"}";
+static NSString *const kCHZZKAutoSkipScript =
+@"(() => {"
+"if (window.__chzzkShieldInstalled) return;"
+"window.__chzzkShieldInstalled = true;"
+"const fixed = { hacked: 1, id: null, event: null, ts: null, adCount: null, adControlType: 'STUDIO_CONTROL' };"
+"const fixedText = JSON.stringify(fixed);"
+"const isAdPolling = (url) => typeof url === 'string' && url.includes('/ad-polling/');"
+"const clickSkip = () => {"
+"  const selectors = [\"button[data-role='skipBtn']\", \"button[aria-label*='Skip']\", \"button[aria-label*='건너뛰기']\", \"button[class*='skip']\"];"
+"  for (const s of selectors) {"
+"    const btn = document.querySelector(s);"
+"    if (!btn) continue;"
+"    const style = window.getComputedStyle(btn);"
+"    if (style && style.display === 'none') continue;"
+"    btn.click();"
+"  }"
+"};"
+"const originalFetch = window.fetch;"
+"if (typeof originalFetch === 'function') {"
+"  window.fetch = async function(input, init) {"
+"    const url = typeof input === 'string' ? input : (input && input.url) || '';"
+"    if (isAdPolling(url)) {"
+"      return new Response(fixedText, { status: 200, headers: { 'Content-Type': 'application/json' } });"
+"    }"
+"    return originalFetch.call(this, input, init);"
+"  };"
+"}"
+"const XHR = XMLHttpRequest && XMLHttpRequest.prototype;"
+"if (XHR && !XHR.__chzzkShieldPatched) {"
+"  XHR.__chzzkShieldPatched = true;"
+"  const open = XHR.open;"
+"  const send = XHR.send;"
+"  XHR.open = function(method, url) { this.__chzzkShieldUrl = url; return open.apply(this, arguments); };"
+"  XHR.send = function() {"
+"    if (isAdPolling(this.__chzzkShieldUrl || '')) {"
+"      try {"
+"        Object.defineProperty(this, 'readyState', { configurable: true, get: () => 4 });"
+"        Object.defineProperty(this, 'status', { configurable: true, get: () => 200 });"
+"        Object.defineProperty(this, 'responseText', { configurable: true, get: () => fixedText });"
+"        Object.defineProperty(this, 'response', { configurable: true, get: () => fixedText });"
+"      } catch (e) {}"
+"      try { this.dispatchEvent(new Event('readystatechange')); } catch (e) {}"
+"      try { this.dispatchEvent(new Event('load')); } catch (e) {}"
+"      try { this.dispatchEvent(new Event('loadend')); } catch (e) {}"
+"      return;"
+"    }"
+"    return send.apply(this, arguments);"
+"  };"
+"}"
+"clickSkip();"
+"setInterval(clickSkip, 450);"
+"new MutationObserver(clickSkip).observe(document.documentElement || document.body, { childList: true, subtree: true });"
+"})();";
+
+static NSString *const kCHZZKHandledKey = @"com.lemonflare.chzzkshield.handled";
+static const void *kCHZZKScriptInstalledKey = &kCHZZKScriptInstalledKey;
+
+@interface CHZZKAdBlockURLProtocol : NSURLProtocol
+@end
+
+static NSString *LowerString(NSString *value) {
+    if (![value isKindOfClass:[NSString class]]) return @"";
+    return value.lowercaseString;
 }
 
-static void loadProxyServers() {
-    NSString *jsPath = [[NSBundle mainBundle] pathForResource:@"twitch.user" ofType:@"js"];
-    if (!jsPath) jsPath = [[NSBundle mainBundle] pathForResource:@"twitch_proxy" ofType:@"js"];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:jsPath]) {
-        jsPath = @"/var/jb/Library/Application Support/TwitchProxy/twitch_proxy.js";
+static BOOL HasAnySuffix(NSString *value, NSArray<NSString *> *suffixes) {
+    if (value.length == 0 || suffixes.count == 0) return NO;
+    for (NSString *suffix in suffixes) {
+        if (suffix.length == 0) continue;
+        if ([value isEqualToString:suffix] || [value hasSuffix:[@"." stringByAppendingString:suffix]]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL ContainsAnyFragment(NSString *value, NSArray<NSString *> *fragments) {
+    if (value.length == 0 || fragments.count == 0) return NO;
+    for (NSString *fragment in fragments) {
+        if (fragment.length == 0) continue;
+        if ([value containsString:fragment]) return YES;
+    }
+    return NO;
+}
+
+static BOOL IsHTTPURL(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) return NO;
+    NSString *scheme = LowerString(url.scheme);
+    return [scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"];
+}
+
+static BOOL IsAdPollingURL(NSURL *url) {
+    NSString *absolute = LowerString(url.absoluteString);
+    return [absolute containsString:@"/ad-polling/"] || [absolute containsString:@"ad-polling"];
+}
+
+static BOOL IsKnownAdHost(NSString *host) {
+    return HasAnySuffix(host, @[
+        @"veta.naver.com",
+        @"adcr.naver.com",
+        @"gfa.naver.com",
+        @"doubleclick.net",
+        @"googlesyndication.com",
+        @"googleadservices.com",
+        @"adservice.google.com"
+    ]);
+}
+
+static BOOL IsNaverFamilyHost(NSString *host) {
+    return HasAnySuffix(host, @[
+        @"chzzk.naver.com",
+        @"naver.com",
+        @"navercorp.com",
+        @"pstatic.net"
+    ]);
+}
+
+static BOOL HasAdPathSignal(NSString *path) {
+    if (path.length == 0) return NO;
+
+    NSArray<NSString *> *segments = [path componentsSeparatedByString:@"/"];
+    for (NSString *raw in segments) {
+        NSString *segment = LowerString(raw);
+        if (segment.length == 0) continue;
+
+        if ([segment isEqualToString:@"ad"] || [segment isEqualToString:@"ads"]) return YES;
+        if ([segment hasPrefix:@"ad-"] || [segment hasPrefix:@"ads-"]) return YES;
+        if ([segment hasSuffix:@"-ad"] || [segment hasSuffix:@"-ads"]) return YES;
+        if ([segment containsString:@"advert"] || [segment containsString:@"adpoll"]) return YES;
     }
 
-    if ([[NSFileManager defaultManager] fileExistsAtPath:jsPath]) {
-        NSString *jsCode = [NSString stringWithContentsOfFile:jsPath encoding:NSUTF8StringEncoding error:nil];
-        if (jsCode) {
-            NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"PROXY_SERVERS\\s*=\\s*\\[(.*?)\\];" options:NSRegularExpressionDotMatchesLineSeparators error:nil];
-            NSTextCheckingResult *match = [regex firstMatchInString:jsCode options:0 range:NSMakeRange(0, jsCode.length)];
+    return NO;
+}
 
-            if (match) {
-                NSString *arrayContent = [jsCode substringWithRange:[match rangeAtIndex:1]];
-                NSRegularExpression *urlRegex = [NSRegularExpression regularExpressionWithPattern:@"'([^']+)'|\"([^\"]+)\"" options:0 error:nil];
-                NSArray *urlMatches = [urlRegex matchesInString:arrayContent options:0 range:NSMakeRange(0, arrayContent.length)];
+static BOOL HasAdQuerySignal(NSString *query) {
+    return ContainsAnyFragment(query, @[
+        @"adid=",
+        @"ad_id=",
+        @"adunit=",
+        @"ad_unit=",
+        @"advert=",
+        @"advertising="
+    ]);
+}
 
-                NSMutableArray<NSString *> *servers = [NSMutableArray array];
-                for (NSTextCheckingResult *urlMatch in urlMatches) {
-                    NSRange range = [urlMatch rangeAtIndex:1];
-                    if (range.location == NSNotFound) range = [urlMatch rangeAtIndex:2];
-                    if (range.location != NSNotFound) {
-                        NSString *server = trimmedString([arrayContent substringWithRange:range]);
-                        if (server.length > 0) [servers addObject:server];
-                    }
-                }
+static CHZZKRequestPolicy RequestPolicyForURL(NSURL *url) {
+    if (!IsHTTPURL(url)) return CHZZKRequestPolicyAllow;
 
-                if (servers.count > 0) {
-                    proxyServers = [servers copy];
-                    NSLog(@"[TwitchProxy] Loaded %lu proxy servers from JS", (unsigned long)proxyServers.count);
-                    return;
-                }
-            }
+    if (IsAdPollingURL(url)) return CHZZKRequestPolicyStubAdPolling;
+
+    NSString *host = LowerString(url.host);
+    NSString *path = LowerString(url.path);
+    NSString *query = LowerString(url.query);
+    NSString *absolute = LowerString(url.absoluteString);
+
+    if (IsKnownAdHost(host)) return CHZZKRequestPolicyBlock;
+
+    if (ContainsAnyFragment(absolute, @[
+        @"doubleclick.net",
+        @"googlesyndication.com",
+        @"googleadservices.com",
+        @"adservice.google.com"
+    ])) {
+        return CHZZKRequestPolicyBlock;
+    }
+
+    if (IsNaverFamilyHost(host) && (HasAdPathSignal(path) || HasAdQuerySignal(query))) {
+        return CHZZKRequestPolicyBlock;
+    }
+
+    return CHZZKRequestPolicyAllow;
+}
+
+@implementation CHZZKAdBlockURLProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if (![request isKindOfClass:[NSURLRequest class]]) return NO;
+
+    if ([NSURLProtocol propertyForKey:kCHZZKHandledKey inRequest:request]) {
+        return NO;
+    }
+
+    CHZZKRequestPolicy policy = RequestPolicyForURL(request.URL);
+    return policy != CHZZKRequestPolicyAllow;
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
+- (void)startLoading {
+    NSMutableURLRequest *markedRequest = [self.request mutableCopy];
+    if (markedRequest) {
+        [NSURLProtocol setProperty:@YES forKey:kCHZZKHandledKey inRequest:markedRequest];
+    }
+
+    NSURL *url = self.request.URL;
+    CHZZKRequestPolicy policy = RequestPolicyForURL(url);
+
+    if (policy == CHZZKRequestPolicyStubAdPolling) {
+        NSData *data = [kCHZZKAdPollingResponse dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary<NSString *, NSString *> *headers = @{
+            @"Content-Type": @"application/json; charset=utf-8",
+            @"Cache-Control": @"no-store, no-cache"
+        };
+
+        NSHTTPURLResponse *response = [[NSHTTPURLResponse alloc] initWithURL:url
+                                                                   statusCode:200
+                                                                  HTTPVersion:@"HTTP/1.1"
+                                                                 headerFields:headers];
+
+        [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        [self.client URLProtocol:self didLoadData:data];
+        [self.client URLProtocolDidFinishLoading:self];
+        NSLog(@"[CHZZKShield] Stubbed ad-polling response: %@", url.absoluteString);
+        return;
+    }
+
+    NSDictionary *userInfo = url ? @{ NSURLErrorFailingURLErrorKey: url } : nil;
+    NSError *error = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorCancelled userInfo:userInfo];
+    [self.client URLProtocol:self didFailWithError:error];
+    NSLog(@"[CHZZKShield] Blocked ad request: %@", url.absoluteString);
+}
+
+- (void)stopLoading {
+}
+
+@end
+
+static void InstallProtocolClassIfNeeded(NSURLSessionConfiguration *configuration) {
+    if (![configuration isKindOfClass:[NSURLSessionConfiguration class]]) return;
+
+    NSArray *currentClasses = configuration.protocolClasses ?: @[];
+    for (Class cls in currentClasses) {
+        if (cls == [CHZZKAdBlockURLProtocol class]) {
+            return;
         }
     }
 
-    proxyServers = @[ @"https://proxy4.rte.net.ru/", @"https://proxy7.rte.net.ru/", @"https://proxy5.rte.net.ru/", @"https://proxy6.rte.net.ru/" ];
-    NSLog(@"[TwitchProxy] Using default proxy servers");
+    NSMutableArray *updated = [NSMutableArray arrayWithObject:[CHZZKAdBlockURLProtocol class]];
+    [updated addObjectsFromArray:currentClasses];
+    configuration.protocolClasses = updated;
 }
 
-static NSString *normalizedProxyUrl(void) {
-    NSString *proxyUrl = proxyServers.firstObject;
-    if (proxyUrl.length == 0) return nil;
-    return [proxyUrl hasSuffix:@"/"] ? proxyUrl : [proxyUrl stringByAppendingString:@"/"];
-}
+static void InstallAutoSkipScriptIfNeeded(WKWebViewConfiguration *configuration) {
+    if (![configuration isKindOfClass:[WKWebViewConfiguration class]]) return;
 
-static NSString *encodedQueryValue(NSString *value) {
-    NSMutableCharacterSet *allowed = [[NSCharacterSet URLQueryAllowedCharacterSet] mutableCopy];
-    [allowed removeCharactersInString:@"&=+?"];
-    return [value stringByAddingPercentEncodingWithAllowedCharacters:allowed];
-}
+    @synchronized (configuration) {
+        NSNumber *installed = objc_getAssociatedObject(configuration, kCHZZKScriptInstalledKey);
+        if (installed.boolValue) return;
 
-static NSString *appendQueryParameter(NSString *urlString, NSString *name, NSString *value) {
-    if (urlString.length == 0 || name.length == 0 || value.length == 0) return urlString;
-
-    NSString *needle = [name stringByAppendingString:@"="];
-    if ([urlString rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound) return urlString;
-
-    NSString *separator = [urlString containsString:@"?"] ? @"&" : @"?";
-    return [NSString stringWithFormat:@"%@%@%@=%@", urlString, separator, name, encodedQueryValue(value)];
-}
-
-static NSString *authTokenFromCookies(void) {
-    NSHTTPCookieStorage *cookieStorage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
-    for (NSHTTPCookie *cookie in [cookieStorage cookies]) {
-        if ([[cookie name] isEqualToString:@"auth-token"]) return [cookie value];
-    }
-    return nil;
-}
-
-static NSString *currentAuthToken(void) {
-    @synchronized ([NSBundle mainBundle]) {
-        if (capturedAuthToken.length > 0) return capturedAuthToken;
-    }
-    return authTokenFromCookies();
-}
-
-static BOOL isTwitchRelatedHost(NSString *host) {
-    NSString *lowerHost = host.lowercaseString;
-    if (lowerHost.length == 0) return NO;
-    return [lowerHost isEqualToString:@"twitch.tv"] ||
-           [lowerHost hasSuffix:@".twitch.tv"] ||
-           [lowerHost isEqualToString:@"ttvnw.net"] ||
-           [lowerHost hasSuffix:@".ttvnw.net"] ||
-           [lowerHost isEqualToString:@"jtvnw.net"] ||
-           [lowerHost hasSuffix:@".jtvnw.net"] ||
-           [lowerHost isEqualToString:@"twitchcdn.net"] ||
-           [lowerHost hasSuffix:@".twitchcdn.net"];
-}
-
-static void captureAuthTokenFromRequest(NSURLRequest *request) {
-    if (!request) return;
-    if (!isTwitchRelatedHost(request.URL.host)) return;
-
-    NSDictionary *headers = request.allHTTPHeaderFields;
-    NSString *authorization = headers[@"Authorization"] ?: headers[@"authorization"];
-    NSString *token = nil;
-
-    if ([authorization isKindOfClass:[NSString class]]) {
-        NSString *trimmed = trimmedString(authorization);
-        if ([trimmed rangeOfString:@"OAuth " options:NSCaseInsensitiveSearch].location == 0) {
-            token = [trimmed substringFromIndex:6];
-        } else if ([trimmed rangeOfString:@"Bearer " options:NSCaseInsensitiveSearch].location == 0) {
-            token = [trimmed substringFromIndex:7];
+        WKUserContentController *controller = configuration.userContentController;
+        if (!controller) {
+            controller = [[WKUserContentController alloc] init];
+            configuration.userContentController = controller;
         }
-    }
 
-    if (!token) {
-        NSString *cookieHeader = headers[@"Cookie"] ?: headers[@"cookie"];
-        if ([cookieHeader isKindOfClass:[NSString class]]) {
-            NSArray<NSString *> *cookies = [cookieHeader componentsSeparatedByString:@";"];
-            for (NSString *cookie in cookies) {
-                NSString *trimmedCookie = trimmedString(cookie);
-                if ([trimmedCookie hasPrefix:@"auth-token="]) {
-                    token = [[trimmedCookie substringFromIndex:11] stringByRemovingPercentEncoding];
-                    break;
-                }
-            }
-        }
-    }
-
-    token = trimmedString(token);
-    if (token.length == 0) return;
-
-    @synchronized ([NSBundle mainBundle]) {
-        if (![capturedAuthToken isEqualToString:token]) {
-            capturedAuthToken = [token copy];
-            NSLog(@"[TwitchProxy] Captured Twitch auth token from native request");
-        }
+        WKUserScript *script = [[WKUserScript alloc] initWithSource:kCHZZKAutoSkipScript
+                                                      injectionTime:WKUserScriptInjectionTimeAtDocumentEnd
+                                                   forMainFrameOnly:NO];
+        [controller addUserScript:script];
+        objc_setAssociatedObject(configuration, kCHZZKScriptInstalledKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
-static BOOL shouldProxyURL(NSURL *url) {
-    if (!url || ![url isKindOfClass:[NSURL class]]) return NO;
-
-    NSString *scheme = url.scheme.lowercaseString;
-    if (!([scheme isEqualToString:@"https"] || [scheme isEqualToString:@"http"])) return NO;
-
-    NSString *host = url.host.lowercaseString;
-    if (![host isEqualToString:@"usher.ttvnw.net"]) return NO;
-
-    NSString *absoluteString = url.absoluteString;
-    if ([absoluteString rangeOfString:@"picture-by-picture" options:NSCaseInsensitiveSearch].location != NSNotFound) return NO;
-
-    NSString *path = url.path.lowercaseString;
-    if (![path hasSuffix:@".m3u8"]) return NO;
-
-    return YES;
+static void BootstrapWebViewIfNeeded(WKWebView *webView) {
+    if (![webView isKindOfClass:[WKWebView class]]) return;
+    InstallAutoSkipScriptIfNeeded(webView.configuration);
+    [webView evaluateJavaScript:kCHZZKAutoSkipScript completionHandler:nil];
 }
 
-static NSURL *proxiedURLForURL(NSURL *originalURL) {
-    if (!shouldProxyURL(originalURL)) return originalURL;
+%hook NSURLSessionConfiguration
 
-    NSString *proxyUrl = normalizedProxyUrl();
-    NSString *originalUrlString = originalURL.absoluteString;
-    if (proxyUrl.length == 0 || originalUrlString.length == 0) return originalURL;
-
-    NSString *newUrlString = [proxyUrl stringByAppendingString:originalUrlString];
-    newUrlString = appendQueryParameter(newUrlString, @"proxymode", proxyAdBlockMode);
-
-    NSString *authToken = currentAuthToken();
-    if (authToken.length > 0) newUrlString = appendQueryParameter(newUrlString, @"auth", authToken);
-
-    NSURL *newURL = [NSURL URLWithString:newUrlString];
-    if (!newURL) {
-        NSLog(@"[TwitchProxy] Failed to create proxied URL for HLS request");
-        return originalURL;
-    }
-
-    NSLog(@"[TwitchProxy] Proxied HLS request: %@", originalURL.path);
-    return newURL;
++ (NSURLSessionConfiguration *)defaultSessionConfiguration {
+    NSURLSessionConfiguration *configuration = %orig;
+    InstallProtocolClassIfNeeded(configuration);
+    return configuration;
 }
 
-static NSURLRequest *proxiedRequestForRequest(NSURLRequest *originalRequest) {
-    if (!originalRequest) return originalRequest;
-    captureAuthTokenFromRequest(originalRequest);
-
-    NSURL *newURL = proxiedURLForURL(originalRequest.URL);
-    if (newURL == originalRequest.URL || [newURL isEqual:originalRequest.URL]) return originalRequest;
-
-    NSMutableURLRequest *newRequest = [originalRequest mutableCopy];
-    newRequest.URL = newURL;
-    return [newRequest copy];
++ (NSURLSessionConfiguration *)ephemeralSessionConfiguration {
+    NSURLSessionConfiguration *configuration = %orig;
+    InstallProtocolClassIfNeeded(configuration);
+    return configuration;
 }
+
++ (NSURLSessionConfiguration *)backgroundSessionConfigurationWithIdentifier:(NSString *)identifier {
+    NSURLSessionConfiguration *configuration = %orig(identifier);
+    InstallProtocolClassIfNeeded(configuration);
+    return configuration;
+}
+
++ (NSURLSessionConfiguration *)backgroundSessionConfiguration:(NSString *)identifier {
+    NSURLSessionConfiguration *configuration = %orig(identifier);
+    InstallProtocolClassIfNeeded(configuration);
+    return configuration;
+}
+
+%end
 
 %hook NSURLSession
 
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-    return %orig(proxiedRequestForRequest(request));
++ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration {
+    InstallProtocolClassIfNeeded(configuration);
+    return %orig(configuration);
 }
 
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completionHandler {
-    return %orig(proxiedRequestForRequest(request), completionHandler);
++ (NSURLSession *)sessionWithConfiguration:(NSURLSessionConfiguration *)configuration delegate:(id)delegate delegateQueue:(NSOperationQueue *)queue {
+    InstallProtocolClassIfNeeded(configuration);
+    return %orig(configuration, delegate, queue);
 }
 
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url {
-    return %orig(proxiedURLForURL(url));
+- (instancetype)initWithConfiguration:(NSURLSessionConfiguration *)configuration {
+    InstallProtocolClassIfNeeded(configuration);
+    return %orig(configuration);
 }
 
-- (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url completionHandler:(id)completionHandler {
-    return %orig(proxiedURLForURL(url), completionHandler);
-}
-
-- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request {
-    return %orig(proxiedRequestForRequest(request));
-}
-
-- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request completionHandler:(id)completionHandler {
-    return %orig(proxiedRequestForRequest(request), completionHandler);
-}
-
-- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url {
-    return %orig(proxiedURLForURL(url));
-}
-
-- (NSURLSessionDownloadTask *)downloadTaskWithURL:(NSURL *)url completionHandler:(id)completionHandler {
-    return %orig(proxiedURLForURL(url), completionHandler);
-}
-
-- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData {
-    return %orig(proxiedRequestForRequest(request), bodyData);
-}
-
-- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData completionHandler:(id)completionHandler {
-    return %orig(proxiedRequestForRequest(request), bodyData, completionHandler);
-}
-
-- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromFile:(NSURL *)fileURL {
-    return %orig(proxiedRequestForRequest(request), fileURL);
-}
-
-- (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromFile:(NSURL *)fileURL completionHandler:(id)completionHandler {
-    return %orig(proxiedRequestForRequest(request), fileURL, completionHandler);
+- (instancetype)initWithConfiguration:(NSURLSessionConfiguration *)configuration delegate:(id)delegate delegateQueue:(NSOperationQueue *)queue {
+    InstallProtocolClassIfNeeded(configuration);
+    return %orig(configuration, delegate, queue);
 }
 
 %end
 
-%hook NSURLRequest
+%hook WKWebView
 
-+ (instancetype)requestWithURL:(NSURL *)URL {
-    return %orig(proxiedURLForURL(URL));
+- (instancetype)initWithFrame:(CGRect)frame configuration:(WKWebViewConfiguration *)configuration {
+    InstallAutoSkipScriptIfNeeded(configuration);
+    id instance = %orig(frame, configuration);
+    BootstrapWebViewIfNeeded(instance);
+    return instance;
 }
 
-- (instancetype)initWithURL:(NSURL *)URL {
-    return %orig(proxiedURLForURL(URL));
+- (instancetype)initWithCoder:(NSCoder *)coder {
+    id instance = %orig(coder);
+    BootstrapWebViewIfNeeded(instance);
+    return instance;
 }
 
-- (instancetype)initWithURL:(NSURL *)URL cachePolicy:(NSURLRequestCachePolicy)cachePolicy timeoutInterval:(NSTimeInterval)timeoutInterval {
-    return %orig(proxiedURLForURL(URL), cachePolicy, timeoutInterval);
+- (WKNavigation *)loadRequest:(NSURLRequest *)request {
+    BootstrapWebViewIfNeeded(self);
+    return %orig(request);
 }
 
-%end
-
-%hook NSMutableURLRequest
-
-+ (instancetype)requestWithURL:(NSURL *)URL {
-    return %orig(proxiedURLForURL(URL));
-}
-
-- (instancetype)initWithURL:(NSURL *)URL {
-    return %orig(proxiedURLForURL(URL));
-}
-
-- (instancetype)initWithURL:(NSURL *)URL cachePolicy:(NSURLRequestCachePolicy)cachePolicy timeoutInterval:(NSTimeInterval)timeoutInterval {
-    return %orig(proxiedURLForURL(URL), cachePolicy, timeoutInterval);
-}
-
-%end
-
-%hook AVPlayer
-
-+ (instancetype)playerWithURL:(NSURL *)URL {
-    return %orig(proxiedURLForURL(URL));
-}
-
-- (instancetype)initWithURL:(NSURL *)URL {
-    return %orig(proxiedURLForURL(URL));
-}
-
-%end
-
-%hook AVPlayerItem
-
-+ (instancetype)playerItemWithURL:(NSURL *)URL {
-    return %orig(proxiedURLForURL(URL));
-}
-
-- (instancetype)initWithURL:(NSURL *)URL {
-    return %orig(proxiedURLForURL(URL));
-}
-
-%end
-
-%hook AVURLAsset
-
-+ (instancetype)URLAssetWithURL:(NSURL *)URL options:(NSDictionary<NSString *,id> *)options {
-    return %orig(proxiedURLForURL(URL), options);
-}
-
-- (instancetype)initWithURL:(NSURL *)URL options:(NSDictionary<NSString *,id> *)options {
-    return %orig(proxiedURLForURL(URL), options);
+- (WKNavigation *)loadHTMLString:(NSString *)string baseURL:(NSURL *)baseURL {
+    BootstrapWebViewIfNeeded(self);
+    return %orig(string, baseURL);
 }
 
 %end
 
 %ctor {
-    NSLog(@"[TwitchProxy] Native tweak loaded");
-    loadProxyServers();
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier] ?: @"(unknown)";
+    NSLog(@"[CHZZKShield] Tweak loaded in bundle: %@", bundleID);
+    [NSURLProtocol registerClass:[CHZZKAdBlockURLProtocol class]];
 }

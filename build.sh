@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-echo "Building TwitchProxy for iOS..."
+echo "Building CHZZKShield for iOS..."
 
 if [[ "${OSTYPE:-}" != linux-gnu* && "${OSTYPE:-}" != darwin* ]]; then
     echo "This script must be run on Linux, macOS, or WSL."
@@ -30,11 +30,8 @@ fi
 echo "Theos: $THEOS"
 echo "Version: $VERSION"
 
-mkdir -p "resources/Library/Application Support/TwitchProxy"
-cp twitch.user.js "resources/Library/Application Support/TwitchProxy/twitch_proxy.js"
-
 make clean
-make package
+make package DEBUG=0 FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
 
 PACKAGE=$(find packages -name "*.deb" | head -n 1)
 if [[ -z "$PACKAGE" ]]; then
@@ -42,7 +39,7 @@ if [[ -z "$PACKAGE" ]]; then
     exit 1
 fi
 
-OUTPUT="TwitchProxy_${VERSION}.deb"
+OUTPUT="CHZZKShield_${VERSION}.deb"
 cp "$PACKAGE" "$OUTPUT"
 
 echo "Build complete: $OUTPUT"

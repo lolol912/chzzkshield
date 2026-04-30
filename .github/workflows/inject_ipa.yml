@@ -1,4 +1,4 @@
-name: Inject TwitchProxy into IPA
+name: Inject CHZZKShield into IPA
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ on:
         description: "App name override"
         required: false
         type: string
-        default: "Twitch"
+        default: "CHZZK"
 
       bundle_id:
         description: "Bundle ID override (leave empty to keep the original app ID)"
@@ -25,7 +25,7 @@ on:
         description: "Display name for the output IPA"
         required: true
         type: string
-        default: "Twitch+Proxy"
+        default: "CHZZK+Shield"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   inject_and_package:
-    name: Inject TwitchProxy and Package
+    name: Inject CHZZKShield and Package
     runs-on: macos-latest
     permissions:
       contents: write
@@ -49,7 +49,7 @@ jobs:
         id: theos
         uses: actions/cache@v4
         env:
-          cache-name: theos_cache_twitch
+          cache-name: theos_cache_chzzk
         with:
           path: theos/
           key: ${{ env.cache-name }}
@@ -73,15 +73,10 @@ jobs:
           git checkout
           mv *.sdk "$THEOS/sdks"
 
-      - name: Bundle userscript reference
-        run: |
-          mkdir -p "resources/Library/Application Support/TwitchProxy"
-          cp twitch.user.js "resources/Library/Application Support/TwitchProxy/twitch_proxy.js"
-
       - name: Install dependencies
         run: brew install ldid dpkg
 
-      - name: Build TwitchProxy.dylib
+      - name: Build CHZZKShield.dylib
         run: |
           make clean
           make package DEBUG=0 FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
@@ -126,12 +121,12 @@ jobs:
       - name: Install cyan
         run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
 
-      - name: Inject TwitchProxy into IPA
+      - name: Inject CHZZKShield into IPA
         run: |
-          DYLIB=$(find . -maxdepth 1 \( -name "TwitchProxy.dylib" -o -name "com.*.dylib" \) | head -n 1)
+          DYLIB=$(find . -maxdepth 1 \( -name "CHZZKShield.dylib" -o -name "com.*.dylib" \) | head -n 1)
 
           if [ -z "$DYLIB" ]; then
-            echo "::error::TwitchProxy.dylib not found"
+            echo "::error::CHZZKShield.dylib not found"
             exit 1
           fi
 
@@ -178,11 +173,11 @@ jobs:
       - name: Upload to GitHub Releases
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: twitch-proxy-${{ github.run_number }}
-          name: TwitchProxy IPA (${{ github.run_number }})
+          tag_name: chzzk-shield-${{ github.run_number }}
+          name: CHZZKShield IPA (${{ github.run_number }})
           files: ${{ github.event.inputs.display_name }}.ipa
           body: |
-            ## TwitchProxy Injected IPA
+            ## CHZZKShield Injected IPA
 
             ### Configuration
             - App name: ${{ github.event.inputs.app_name }}
@@ -190,22 +185,18 @@ jobs:
             - Bundle ID override: ${{ github.event.inputs.bundle_id || 'none' }}
 
             ### Features
-            - Native HLS playlist proxying for the Twitch iOS app
-            - 1080p/1440p access through ReYohoho proxy servers
-            - Server-side ad bypass request via `proxymode=adblock` (best effort, not full VAFT)
-            - OAuth/auth-token forwarding for proxy compatibility
+            - URL-level ad request pre-blocking
+            - `/ad-polling/` fixed JSON response stub
+            - WKWebView skip-button auto-click
 
             ### Notes
-            - Leave the bundle ID override empty unless you know you need to change it.
-            - Changing the bundle ID can break Twitch login, chat, keychain, and app-group state.
-            - `proxymode=adblock` depends on proxy server support and may not block every Twitch ad.
-            - This project is unofficial and is not affiliated with Twitch Interactive, Inc.
-            - This repository does not provide modified IPA files, decrypted app binaries, or Twitch assets.
-            - This draft output was generated from a user-supplied IPA URL. Do not publish it unless you have the legal right to distribute it.
-            - Users are solely responsible for complying with Twitch's Terms of Service and applicable laws.
+            - Leave bundle ID empty unless you intentionally need to change it.
+            - URL patterns/selectors may need maintenance after app updates.
+            - This project is unofficial and is not affiliated with NAVER or CHZZK.
+            - Draft output is generated from a user-supplied IPA URL; do not redistribute unless legally permitted.
           draft: true
 
       - name: Output Release URL
         run: |
           echo "::notice::Release created"
-          echo "::notice::Download at: https://github.com/${{ github.repository }}/releases/tag/twitch-proxy-${{ github.run_number }}"
+          echo "::notice::Download at: https://github.com/${{ github.repository }}/releases/tag/chzzk-shield-${{ github.run_number }}"
