@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "URL to the decrypted IPA file"
+        description: "https://www.dropbox.com/scl/fi/4hnpjv96z62icmkldeyq7/CHZZK_v3.5.12.ipa?rlkey=ry56xb1ncb1cu8qguzau2au4o&e=1&st=8i365wbf&dl=0"
         required: true
         type: string
         default: ""
